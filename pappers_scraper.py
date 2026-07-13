@@ -92,6 +92,32 @@ def save_to_csv(data: List[Dict[str, str]], filepath: str = "entreprises_pappers
     except Exception as e:
         logger.error(f"Erreur lors de l'écriture du fichier CSV : {e}")
 
+def append_to_csv(data: List[Dict[str, str]], filepath: str = "entreprises_pappers.csv") -> None:
+    """
+    Ajoute une liste d'entreprises au fichier CSV en cours avec encodage utf-8-sig.
+    Si le fichier n'existe pas, il écrit l'en-tête en premier.
+    """
+    if not data:
+        return
+
+    fieldnames = ["Nom de l'entreprise", "SIREN", "Chiffre d'affaires", "Marge nette"]
+    file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
+
+    try:
+        with open(filepath, mode="a", encoding="utf-8-sig", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=";")
+            if not file_exists:
+                writer.writeheader()
+            for row in data:
+                writer.writerow({
+                    "Nom de l'entreprise": row.get("Nom de l'entreprise", ""),
+                    "SIREN": row.get("SIREN", ""),
+                    "Chiffre d'affaires": row.get("Chiffre d'affaires", ""),
+                    "Marge nette": row.get("Marge nette", "")
+                })
+    except Exception as e:
+        logger.error(f"Erreur lors de l'écriture incrémentale du fichier CSV : {e}")
+
 def extract_siren_from_text(text: str) -> Optional[str]:
     """
     Extrait un SIREN (9 chiffres consécutifs) d'un texte.
@@ -323,6 +349,13 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
     all_companies = []
     scraped_sirens = set()
 
+    # Réinitialiser le fichier CSV pour démarrer proprement un nouveau scraping
+    if os.path.exists(output_file):
+        try:
+            os.remove(output_file)
+        except Exception:
+            pass
+
     with sync_playwright() as p:
         user_agent = random.choice(USER_AGENTS)
         logger.info(f"Démarrage du navigateur avec l'User-Agent : {user_agent}")
@@ -381,6 +414,7 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
         page_number = 1
         while True:
             logger.info(f"--- Scraping de la page {page_number} ---")
+            page_companies = []
 
             # Faire défiler la page pour simuler une lecture et s'assurer du chargement des images/éléments
             try:
@@ -428,14 +462,17 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
             # Analyse de chaque carte d'entreprise sur la page en cours
             for card in cards:
                 try:
-                    company_data = parse_company_card(card, page)
-                    if company_data:
-                        # Filtrer les faux positifs (comme le résumé du nombre de résultats)
-                        name_lower = company_data["Nom de l'entreprise"].lower()
-                        if "résultats" in name_lower or "recherche" in name_lower or not company_data["Nom de l'entreprise"]:
-                            logger.info(f"Ignorer l'élément faux positif : '{company_data['Nom de l\'entreprise']}'")
+                    # 1. Extraction ultra-rapide et légère du nom pour filtrer les faux positifs avant toute analyse lourde
+                    el = card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                    if el:
+                        name_val = el.inner_text().strip()
+                        name_lower = name_val.lower()
+                        if "résultats" in name_lower or "recherche" in name_lower or not name_val:
+                            logger.info(f"Ignorer l'élément faux positif avant analyse : '{name_val}'")
                             continue
 
+                    company_data = parse_company_card(card, page)
+                    if company_data:
                         # Déduplication basée sur le SIREN ou le Nom de l'entreprise
                         siren_val = company_data.get("SIREN", "")
                         name_val = company_data.get("Nom de l'entreprise", "")
@@ -447,11 +484,17 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
 
                         scraped_sirens.add(dedup_key)
                         all_companies.append(company_data)
+                        page_companies.append(company_data)
                 except Exception as e:
                     logger.error(f"Erreur d'analyse d'une carte d'entreprise : {e}")
 
                 # Délai aléatoire court entre l'analyse de chaque entreprise pour simuler un humain
                 time.sleep(random.uniform(0.5, 1.5))
+
+            # Sauvegarde incrémentale de la page en cours
+            if page_companies:
+                append_to_csv(page_companies, output_file)
+                logger.info(f"Page {page_number} sauvegardée incrémentiellement ({len(page_companies)} entreprises ajoutées).")
 
             # --- Gestion de la pagination ---
             logger.info("Recherche du bouton de pagination suivante...")
@@ -554,10 +597,8 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
         # Fermeture du navigateur
         browser.close()
 
-    # Sauvegarde finale des données récupérées
-    if all_companies:
-        save_to_csv(all_companies, output_file)
-    else:
+    # Plus besoin de sauvegarde finale car elle est faite incrémentiellement après chaque page
+    if not all_companies:
         logger.warning("Aucune entreprise n'a pu être scrapée.")
 
     return all_companies
