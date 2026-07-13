@@ -32,6 +32,17 @@ TARGET_URL = (
     "&chiffre_affaires_max=10000000"
 )
 
+# Générer les sous-intervalles pour partitionner la recherche de façon à contourner la limite de pagination de Pappers
+# (Pappers ne permet d'afficher que 10 pages soit maximum 200 résultats par requête).
+# On crée 18 tranches de 500 000 € entre 1 000 000 € et 10 000 000 €.
+TURNOVER_RANGES = []
+start_val = 1000000
+step_val = 500000
+while start_val < 10000000:
+    end_val = start_val + step_val
+    TURNOVER_RANGES.append((start_val, end_val))
+    start_val = end_val
+
 # Liste de User-Agents réalistes pour simuler différents navigateurs récents
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
@@ -349,12 +360,40 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
     all_companies = []
     scraped_sirens = set()
 
-    # Réinitialiser le fichier CSV pour démarrer proprement un nouveau scraping
-    if os.path.exists(output_file):
+    # Charger les entreprises déjà scrapées si le fichier existe pour pouvoir reprendre le travail
+    # et éviter de rescraper les mêmes données
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+        logger.info(f"Chargement des entreprises existantes depuis {output_file} pour éviter les doublons et reprendre le scraping.")
         try:
-            os.remove(output_file)
-        except Exception:
-            pass
+            with open(output_file, mode="r", encoding="utf-8-sig") as csvfile:
+                reader = csv.DictReader(csvfile, delimiter=";")
+                for row in reader:
+                    siren = row.get("SIREN", "")
+                    name = row.get("Nom de l'entreprise", "")
+                    if siren and siren != "Non trouvé":
+                        scraped_sirens.add(siren)
+                    elif name:
+                        scraped_sirens.add(name)
+            logger.info(f"Déjà {len(scraped_sirens)} entreprises uniques chargées depuis le CSV.")
+        except Exception as e:
+            logger.warning(f"Impossible de lire le CSV existant : {e}")
+
+    # Si l'URL par défaut est utilisée, on utilise le partitionnement par tranches de chiffre d'affaires
+    # pour contourner la limite de pagination de 10 pages de Pappers.fr
+    urls_to_scrape = []
+    if url == TARGET_URL:
+        logger.info(f"Utilisation du partitionnement en {len(TURNOVER_RANGES)} tranches de CA pour contourner la limite des 10 pages.")
+        for min_val, max_val in TURNOVER_RANGES:
+            sub_url = (
+                "https://www.pappers.fr/recherche"
+                "?geolocalisation=43.2999009436%2C5.38227869795%2C10%2Cv"
+                "&siege=true"
+                f"&chiffre_affaires_min={min_val}"
+                f"&chiffre_affaires_max={max_val}"
+            )
+            urls_to_scrape.append((sub_url, f"{min_val} € - {max_val} €"))
+    else:
+        urls_to_scrape.append((url, "Filtre personnalisé"))
 
     with sync_playwright() as p:
         user_agent = random.choice(USER_AGENTS)
@@ -386,218 +425,205 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
 
         page = context.new_page()
 
-        # Navigation vers l'URL
-        logger.info(f"Navigation vers l'URL cible : {url}")
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            logger.error(f"Erreur lors du chargement initial de la page : {e}")
-            browser.close()
-            return []
+        # Pour chaque URL / tranche de chiffre d'affaires
+        for idx, (target_url, label) in enumerate(urls_to_scrape, 1):
+            logger.info(f"=== Début de la tranche {idx}/{len(urls_to_scrape)} : {label} ===")
 
-        # Simulation d'un délai humain après chargement
-        time.sleep(random.uniform(2.0, 4.0))
-
-        # Gestion des cookies si un bouton d'acceptation est visible
-        try:
-            # Plusieurs sélecteurs possibles pour les popups de consentement de cookies/pappers
-            cookie_btn = page.query_selector(
-                "button:has-text('Accepter'), button:has-text('Tout accepter'), #cookies-consent-accept, .cc-btn"
-            )
-            if cookie_btn and cookie_btn.is_visible():
-                cookie_btn.click()
-                logger.info("Cookies acceptés.")
-                time.sleep(random.uniform(1.0, 2.0))
-        except Exception as e:
-            logger.debug(f"Pas de bannière de cookies détectée ou erreur de clic : {e}")
-
-        page_number = 1
-        while True:
-            logger.info(f"--- Scraping de la page {page_number} ---")
-            page_companies = []
-
-            # Faire défiler la page pour simuler une lecture et s'assurer du chargement des images/éléments
+            # Navigation vers l'URL
+            logger.info(f"Navigation vers l'URL : {target_url}")
             try:
-                for _ in range(3):
-                    page.evaluate("window.scrollBy(0, window.innerHeight / 2)")
-                    time.sleep(random.uniform(0.3, 0.7))
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                logger.debug(f"Erreur d'évaluation du scroll : {e}")
+                logger.error(f"Erreur lors du chargement de la tranche : {e}")
+                continue
 
-            # Sélectionner toutes les cartes ou lignes de résultats
-            # Sélecteurs flexibles basés sur l'architecture standard de Pappers
-            card_selectors = [
-                ".resultat-recherche",
-                ".recherche-resultat",
-                "div.border.rounded-lg",
-                "tr.resultat",
-                "[class*='resultat']",
-                "a[href*='/entreprise/']"
-            ]
+            # Simulation d'un délai humain après chargement
+            time.sleep(random.uniform(2.0, 4.0))
 
-            cards = []
-            for selector in card_selectors:
+            # Gestion des cookies seulement lors du premier chargement de la première tranche
+            if idx == 1:
                 try:
-                    cards = page.query_selector_all(selector)
-                    if cards:
-                        logger.info(f"Trouvé {len(cards)} éléments avec le sélecteur '{selector}'")
-                        break
-                except Exception:
-                    continue
-
-            if not cards:
-                # Si aucun sélecteur n'a retourné de cartes, on essaie une recherche d'éléments génériques
-                # qui ressemblent à des cartes de résultats (contenant par exemple "SIREN" ou des montants en €)
-                logger.warning("Aucun élément de résultat spécifique trouvé. Tentative d'analyse générale...")
-                # On essaie d'attendre un peu ou de voir si la page indique aucun résultat
-                body_text = page.inner_text("body")
-                if "aucun résultat" in body_text.lower():
-                    logger.info("La recherche n'a retourné aucun résultat.")
-                    break
-                else:
-                    # On s'arrête proprement s'il n'y a pas d'éléments
-                    logger.warning("Aucun résultat exploitable trouvé sur cette page.")
-                    break
-
-            # Analyse de chaque carte d'entreprise sur la page en cours
-            for card in cards:
-                try:
-                    # 1. Extraction ultra-rapide et légère du nom pour filtrer les faux positifs avant toute analyse lourde
-                    el = card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                    if el:
-                        name_val = el.inner_text().strip()
-                        name_lower = name_val.lower()
-                        if "résultats" in name_lower or "recherche" in name_lower or not name_val:
-                            logger.info(f"Ignorer l'élément faux positif avant analyse : '{name_val}'")
-                            continue
-
-                    company_data = parse_company_card(card, page)
-                    if company_data:
-                        # Déduplication basée sur le SIREN ou le Nom de l'entreprise
-                        siren_val = company_data.get("SIREN", "")
-                        name_val = company_data.get("Nom de l'entreprise", "")
-                        dedup_key = siren_val if (siren_val and siren_val != "Non trouvé") else name_val
-
-                        if dedup_key in scraped_sirens:
-                            logger.info(f"Ignorer l'entreprise déjà scrapée (clé : '{dedup_key}')")
-                            continue
-
-                        scraped_sirens.add(dedup_key)
-                        all_companies.append(company_data)
-                        page_companies.append(company_data)
+                    cookie_btn = page.query_selector(
+                        "button:has-text('Accepter'), button:has-text('Tout accepter'), #cookies-consent-accept, .cc-btn"
+                    )
+                    if cookie_btn and cookie_btn.is_visible():
+                        cookie_btn.click()
+                        logger.info("Cookies acceptés.")
+                        time.sleep(random.uniform(1.0, 2.0))
                 except Exception as e:
-                    logger.error(f"Erreur d'analyse d'une carte d'entreprise : {e}")
+                    logger.debug(f"Pas de bannière de cookies détectée ou erreur de clic : {e}")
 
-                # Délai aléatoire court entre l'analyse de chaque entreprise pour simuler un humain
-                time.sleep(random.uniform(0.5, 1.5))
+            page_number = 1
+            while True:
+                logger.info(f"--- Scraping de la tranche {label} - Page {page_number} ---")
+                page_companies = []
 
-            # Sauvegarde incrémentale de la page en cours
-            if page_companies:
-                append_to_csv(page_companies, output_file)
-                logger.info(f"Page {page_number} sauvegardée incrémentiellement ({len(page_companies)} entreprises ajoutées).")
-
-            # --- Gestion de la pagination ---
-            logger.info("Recherche du bouton de pagination suivante...")
-            next_btn = None
-
-            # Sélecteurs possibles pour la flèche droite ou bouton page suivante
-            next_selectors = [
-                "a.pagination-image-right:not(.disabled)",
-                "a.pagination.pagination-image-right:not(.disabled)",
-                "a.pagination-suivant",
-                "button.pagination-suivant",
-                "a:has-text('Suivant')",
-                "button:has-text('Suivant')",
-                ".pagination a:last-child",
-                "ul.pagination li:last-child a",
-                "svg[class*='right']",
-                "a[aria-label='Next']",
-                "button[aria-label='Next']",
-                # Recherche par texte indicatif de pagination (ex: "1 / 20" ou flèche droite)
-                "xpath=//a[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]",
-                "xpath=//button[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]"
-            ]
-
-            for selector in next_selectors:
+                # Faire défiler la page pour simuler une lecture et s'assurer du chargement des images/éléments
                 try:
-                    el = page.query_selector(selector)
-                    if el and el.is_visible() and el.is_enabled():
-                        # S'assurer que ce n'est pas un bouton de retour
-                        btn_text = el.inner_text().strip()
-                        if btn_text and any(prev in btn_text.lower() for prev in ["précédent", "previous", "‹"]):
-                            continue
-                        next_btn = el
-                        logger.info(f"Bouton page suivante trouvé avec le sélecteur '{selector}'")
-                        break
-                except Exception:
-                    continue
+                    for _ in range(3):
+                        page.evaluate("window.scrollBy(0, window.innerHeight / 2)")
+                        time.sleep(random.uniform(0.3, 0.7))
+                except Exception as e:
+                    logger.debug(f"Erreur d'évaluation du scroll : {e}")
 
-            if next_btn:
-                try:
-                    # Récupérer le nom de la première entreprise sur la page actuelle pour détecter la mise à jour
-                    first_company_before = ""
-                    if cards:
-                        try:
-                            # Rechercher la première entreprise réelle (pas un faux positif) par sélecteur léger de titre
-                            for first_card in cards:
-                                el = first_card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                                if el:
-                                    name_val = el.inner_text().strip()
-                                    if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
-                                        first_company_before = name_val
-                                        break
-                        except Exception:
-                            pass
+                # Sélectionner toutes les cartes ou lignes de résultats
+                # Sélecteurs flexibles basés sur l'architecture standard de Pappers
+                card_selectors = [
+                    ".resultat-recherche",
+                    ".recherche-resultat",
+                    "div.border.rounded-lg",
+                    "tr.resultat",
+                    "[class*='resultat']",
+                    "a[href*='/entreprise/']"
+                ]
 
-                    # Défilement vers le bouton de pagination pour pouvoir cliquer dessus de façon réaliste
-                    next_btn.scroll_into_view_if_needed()
-                    time.sleep(random.uniform(0.5, 1.0))
-                    next_btn.click()
-                    page_number += 1
+                cards = []
+                for selector in card_selectors:
+                    try:
+                        cards = page.query_selector_all(selector)
+                        if cards:
+                            logger.info(f"Trouvé {len(cards)} éléments avec le sélecteur '{selector}'")
+                            break
+                    except Exception:
+                        continue
 
-                    # Attendre la mise à jour des résultats
-                    if first_company_before:
-                        logger.info(f"En attente de la mise à jour des résultats (changement de '{first_company_before}')...")
-                        start_time = time.time()
-                        updated = False
-                        while time.time() - start_time < 15:
+                if not cards:
+                    logger.warning("Aucun élément de résultat spécifique trouvé sur cette page.")
+                    break
+
+                # Analyse de chaque carte d'entreprise sur la page en cours
+                for card in cards:
+                    try:
+                        # 1. Extraction ultra-rapide et légère du nom pour filtrer les faux positifs avant toute analyse lourde
+                        el = card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                        if el:
+                            name_val = el.inner_text().strip()
+                            name_lower = name_val.lower()
+                            if "résultats" in name_lower or "recherche" in name_lower or not name_val:
+                                logger.info(f"Ignorer l'élément faux positif avant analyse : '{name_val}'")
+                                continue
+
+                        company_data = parse_company_card(card, page)
+                        if company_data:
+                            # Déduplication basée sur le SIREN ou le Nom de l'entreprise
+                            siren_val = company_data.get("SIREN", "")
+                            name_val = company_data.get("Nom de l'entreprise", "")
+                            dedup_key = siren_val if (siren_val and siren_val != "Non trouvé") else name_val
+
+                            if dedup_key in scraped_sirens:
+                                logger.info(f"Ignorer l'entreprise déjà scrapée (clé : '{dedup_key}')")
+                                continue
+
+                            scraped_sirens.add(dedup_key)
+                            all_companies.append(company_data)
+                            page_companies.append(company_data)
+                    except Exception as e:
+                        logger.error(f"Erreur d'analyse d'une carte d'entreprise : {e}")
+
+                    # Délai aléatoire court entre l'analyse de chaque entreprise pour simuler un humain
+                    time.sleep(random.uniform(0.5, 1.5))
+
+                # Sauvegarde incrémentale de la page en cours
+                if page_companies:
+                    append_to_csv(page_companies, output_file)
+                    logger.info(f"Tranche {label} - Page {page_number} sauvegardée incrémentiellement ({len(page_companies)} entreprises ajoutées).")
+
+                # --- Gestion de la pagination ---
+                logger.info("Recherche du bouton de pagination suivante...")
+                next_btn = None
+
+                # Sélecteurs possibles pour la flèche droite ou bouton page suivante
+                next_selectors = [
+                    "a.pagination-image-right:not(.disabled)",
+                    "a.pagination.pagination-image-right:not(.disabled)",
+                    "a.pagination-suivant",
+                    "button.pagination-suivant",
+                    "a:has-text('Suivant')",
+                    "button:has-text('Suivant')",
+                    ".pagination a:last-child",
+                    "ul.pagination li:last-child a",
+                    "svg[class*='right']",
+                    "a[aria-label='Next']",
+                    "button[aria-label='Next']",
+                    "xpath=//a[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]",
+                    "xpath=//button[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]"
+                ]
+
+                for selector in next_selectors:
+                    try:
+                        el = page.query_selector(selector)
+                        if el and el.is_visible() and el.is_enabled():
+                            btn_text = el.inner_text().strip()
+                            if btn_text and any(prev in btn_text.lower() for prev in ["précédent", "previous", "‹"]):
+                                continue
+                            next_btn = el
+                            logger.info(f"Bouton page suivante trouvé avec le sélecteur '{selector}'")
+                            break
+                    except Exception:
+                        continue
+
+                if next_btn:
+                    try:
+                        # Récupérer le nom de la première entreprise sur la page actuelle pour détecter la mise à jour
+                        first_company_before = ""
+                        if cards:
                             try:
-                                # Ré-obtenir les cartes de résultats
-                                for sel in card_selectors:
-                                    new_cards = page.query_selector_all(sel)
-                                    if new_cards:
-                                        # Trouver la première entreprise réelle de la nouvelle sélection
-                                        new_first_name = ""
-                                        for nc in new_cards:
-                                            el = nc.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                                            if el:
-                                                name_val = el.inner_text().strip()
-                                                if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
-                                                    new_first_name = name_val
-                                                    break
-                                        if new_first_name and new_first_name != first_company_before:
-                                            logger.info(f"Résultats de la page {page_number} chargés avec succès ! Nouvelle première entreprise : '{new_first_name}'")
-                                            updated = True
+                                for first_card in cards:
+                                    el = first_card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                                    if el:
+                                        name_val = el.inner_text().strip()
+                                        if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
+                                            first_company_before = name_val
                                             break
-                                if updated:
-                                    break
                             except Exception:
                                 pass
-                            time.sleep(0.5)
-                    else:
-                        page.wait_for_load_state("domcontentloaded", timeout=30000)
-                        time.sleep(random.uniform(3.0, 5.0))
-                except Exception as e:
-                    logger.error(f"Erreur lors du clic sur le bouton de page suivante : {e}")
+
+                        # Défilement vers le bouton de pagination pour pouvoir cliquer dessus de façon réaliste
+                        next_btn.scroll_into_view_if_needed()
+                        time.sleep(random.uniform(0.5, 1.0))
+                        next_btn.click()
+                        page_number += 1
+
+                        # Attendre la mise à jour des résultats
+                        if first_company_before:
+                            logger.info(f"En attente de la mise à jour des résultats (changement de '{first_company_before}')...")
+                            start_time = time.time()
+                            updated = False
+                            while time.time() - start_time < 15:
+                                try:
+                                    for sel in card_selectors:
+                                        new_cards = page.query_selector_all(sel)
+                                        if new_cards:
+                                            new_first_name = ""
+                                            for nc in new_cards:
+                                                el = nc.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                                                if el:
+                                                    name_val = el.inner_text().strip()
+                                                    if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
+                                                        new_first_name = name_val
+                                                        break
+                                            if new_first_name and new_first_name != first_company_before:
+                                                logger.info(f"Résultats chargés avec succès ! Nouvelle première entreprise : '{new_first_name}'")
+                                                updated = True
+                                                break
+                                    if updated:
+                                        break
+                                except Exception:
+                                    pass
+                                time.sleep(0.5)
+                        else:
+                            page.wait_for_load_state("domcontentloaded", timeout=30000)
+                            time.sleep(random.uniform(3.0, 5.0))
+                    except Exception as e:
+                        logger.error(f"Erreur lors du clic sur le bouton de page suivante : {e}")
+                        break
+                else:
+                    logger.info("Pas d'autre page disponible dans cette tranche.")
                     break
-            else:
-                logger.info("Pas d'autre page disponible ou bouton de page suivante non détecté.")
-                break
 
         # Fermeture du navigateur
         browser.close()
 
-    # Plus besoin de sauvegarde finale car elle est faite incrémentiellement après chaque page
     if not all_companies:
         logger.warning("Aucune entreprise n'a pu être scrapée.")
 
