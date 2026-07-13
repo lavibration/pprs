@@ -27,6 +27,7 @@ logger = logging.getLogger("pappers_scraper")
 TARGET_URL = (
     "https://www.pappers.fr/recherche"
     "?geolocalisation=43.2999009436%2C5.38227869795%2C10%2Cv"
+    "&siege=true"
     "&chiffre_affaires_min=1000000"
     "&chiffre_affaires_max=10000000"
 )
