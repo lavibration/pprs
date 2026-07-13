@@ -13,7 +13,7 @@ import random
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from playwright.sync_api import sync_playwright, Page, BrowserContext, ElementHandle
-from playwright_stealth import stealth
+from playwright_stealth import Stealth
 
 # Configuration du logging
 logging.basicConfig(
@@ -33,10 +33,10 @@ TARGET_URL = (
 
 # Liste de User-Agents réalistes pour simuler différents navigateurs récents
 USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
 def clean_text(text: Optional[str]) -> str:
@@ -320,6 +320,7 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
     et les exporte dans un fichier CSV.
     """
     all_companies = []
+    scraped_sirens = set()
 
     with sync_playwright() as p:
         user_agent = random.choice(USER_AGENTS)
@@ -343,11 +344,13 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
         )
 
         # Activation de stealth pour masquer Playwright des scripts anti-bot
-        page = context.new_page()
         try:
-            stealth(page)
+            stealth = Stealth()
+            stealth.apply_stealth_sync(context)
         except Exception as e:
-            logger.debug(f"Erreur d'initialisation de stealth-sync : {e}")
+            logger.debug(f"Erreur d'initialisation de stealth : {e}")
+
+        page = context.new_page()
 
         # Navigation vers l'URL
         logger.info(f"Navigation vers l'URL cible : {url}")
@@ -431,6 +434,17 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
                         if "résultats" in name_lower or "recherche" in name_lower or not company_data["Nom de l'entreprise"]:
                             logger.info(f"Ignorer l'élément faux positif : '{company_data['Nom de l\'entreprise']}'")
                             continue
+
+                        # Déduplication basée sur le SIREN ou le Nom de l'entreprise
+                        siren_val = company_data.get("SIREN", "")
+                        name_val = company_data.get("Nom de l'entreprise", "")
+                        dedup_key = siren_val if (siren_val and siren_val != "Non trouvé") else name_val
+
+                        if dedup_key in scraped_sirens:
+                            logger.info(f"Ignorer l'entreprise déjà scrapée (clé : '{dedup_key}')")
+                            continue
+
+                        scraped_sirens.add(dedup_key)
                         all_companies.append(company_data)
                 except Exception as e:
                     logger.error(f"Erreur d'analyse d'une carte d'entreprise : {e}")
@@ -444,6 +458,8 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
 
             # Sélecteurs possibles pour la flèche droite ou bouton page suivante
             next_selectors = [
+                "a.pagination-image-right:not(.disabled)",
+                "a.pagination.pagination-image-right:not(.disabled)",
                 "a.pagination-suivant",
                 "button.pagination-suivant",
                 "a:has-text('Suivant')",
@@ -474,15 +490,59 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
 
             if next_btn:
                 try:
+                    # Récupérer le nom de la première entreprise sur la page actuelle pour détecter la mise à jour
+                    first_company_before = ""
+                    if cards:
+                        try:
+                            # Rechercher la première entreprise réelle (pas un faux positif) par sélecteur léger de titre
+                            for first_card in cards:
+                                el = first_card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                                if el:
+                                    name_val = el.inner_text().strip()
+                                    if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
+                                        first_company_before = name_val
+                                        break
+                        except Exception:
+                            pass
+
                     # Défilement vers le bouton de pagination pour pouvoir cliquer dessus de façon réaliste
                     next_btn.scroll_into_view_if_needed()
                     time.sleep(random.uniform(0.5, 1.0))
                     next_btn.click()
                     page_number += 1
 
-                    # Attendre le chargement de la nouvelle page de résultats
-                    page.wait_for_load_state("domcontentloaded", timeout=30000)
-                    time.sleep(random.uniform(2.0, 4.0))
+                    # Attendre la mise à jour des résultats
+                    if first_company_before:
+                        logger.info(f"En attente de la mise à jour des résultats (changement de '{first_company_before}')...")
+                        start_time = time.time()
+                        updated = False
+                        while time.time() - start_time < 15:
+                            try:
+                                # Ré-obtenir les cartes de résultats
+                                for sel in card_selectors:
+                                    new_cards = page.query_selector_all(sel)
+                                    if new_cards:
+                                        # Trouver la première entreprise réelle de la nouvelle sélection
+                                        new_first_name = ""
+                                        for nc in new_cards:
+                                            el = nc.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
+                                            if el:
+                                                name_val = el.inner_text().strip()
+                                                if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
+                                                    new_first_name = name_val
+                                                    break
+                                        if new_first_name and new_first_name != first_company_before:
+                                            logger.info(f"Résultats de la page {page_number} chargés avec succès ! Nouvelle première entreprise : '{new_first_name}'")
+                                            updated = True
+                                            break
+                                if updated:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.5)
+                    else:
+                        page.wait_for_load_state("domcontentloaded", timeout=30000)
+                        time.sleep(random.uniform(3.0, 5.0))
                 except Exception as e:
                     logger.error(f"Erreur lors du clic sur le bouton de page suivante : {e}")
                     break
@@ -506,5 +566,17 @@ if __name__ == "__main__":
     # Mode headed par défaut comme spécifié dans les consignes techniques pour contourner
     # de manière robuste les protections anti-bot (Cloudflare/recaptcha).
     # Pour exécuter en mode invisible (headless), passer headless=True.
-    results = scrape_pappers(headless=False)
+
+    # Boucle de tentative robuste (retry loop) pour contourner d'éventuels blocages temporaires
+    max_attempts = 10
+    results = []
+    for attempt in range(1, max_attempts + 1):
+        logger.info(f"Tentative de scraping {attempt}/{max_attempts}...")
+        results = scrape_pappers(headless=False)
+        if results:
+            logger.info(f"Scraping réussi à la tentative {attempt} !")
+            break
+        logger.warning(f"La tentative {attempt} n'a retourné aucun résultat. Nouvelle tentative dans quelques secondes...")
+        time.sleep(random.uniform(3.0, 6.0))
+
     logger.info(f"Travail terminé. {len(results)} entreprises traitées.")
