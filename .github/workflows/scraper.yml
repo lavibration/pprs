@@ -1,0 +1,40 @@
+name: Run Scraper and Update CSV
+
+on:
+  schedule:
+    # S'exécute par exemple tous les jours à minuit UTC (ajustable via la syntaxe Cron)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Permet de lancer le script manuellement depuis l'onglet "Actions"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Donne le droit à l'Action de modifier et pousser le CSV sur votre dépôt
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip' # Optionnel : accélère l'installation si vous avez un requirements.txt
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        # Ajoutez ici des dépendances manuelles si vous n'avez pas de requirements.txt (ex: pip install requests beautifulsoup4)
+
+    - name: Run Scraper
+      run: python mon_script.py # Remplacez par le nom de votre script
+
+    - name: Commit and Push changes
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add *.csv # Ou le chemin exact de votre CSV
+        # Le script commit uniquement s'il y a des changements pour éviter les erreurs de build
+        git diff-index --quiet HEAD || (git commit -m "Auto-update CSV: $(date +'%Y-%m-%d %H:%M')" && git push)
