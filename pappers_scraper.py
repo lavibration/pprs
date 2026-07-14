@@ -640,7 +640,8 @@ if __name__ == "__main__":
     results = []
     for attempt in range(1, max_attempts + 1):
         logger.info(f"Tentative de scraping {attempt}/{max_attempts}...")
-        results = scrape_pappers(headless=False)
+        is_github = os.getenv("GITHUB_ACTIONS") == "true"
+        results = scrape_pappers(headless=is_github)
         if results:
             logger.info(f"Scraping réussi à la tentative {attempt} !")
             break
