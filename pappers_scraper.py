@@ -23,25 +23,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pappers_scraper")
 
-# URL cible par défaut
-TARGET_URL = (
-    "https://www.pappers.fr/recherche"
-    "?geolocalisation=43.2999009436%2C5.38227869795%2C10%2Cv"
-    "&siege=true"
-    "&chiffre_affaires_min=1000000"
-    "&chiffre_affaires_max=10000000"
-)
+# Configuration des deux recherches demandées par l'utilisateur
+# Recherche 1 : 1M€ - 10M€ (effectifs de 6 à 500k, rayon 25km de Marseille)
+CONFIG_1M_10M = {
+    "output_file": "entreprises_pappers.csv",
+    "base_url": (
+        "https://www.pappers.fr/recherche"
+        "?geolocalisation=43.2965%2C5.3698%2C25%2Cv"
+        "&siege=true"
+        "&effectifs_min=6"
+        "&effectifs_max=500000"
+    ),
+    "ranges": []  # Sera rempli de tranches de 500 000 €
+}
+start_1 = 1000000
+step_1 = 500000
+while start_1 < 10000000:
+    end_1 = start_1 + step_1
+    CONFIG_1M_10M["ranges"].append((start_1, end_1))
+    start_1 = end_1
 
-# Générer les sous-intervalles pour partitionner la recherche de façon à contourner la limite de pagination de Pappers
-# (Pappers ne permet d'afficher que 10 pages soit maximum 200 résultats par requête).
-# On crée 18 tranches de 500 000 € entre 1 000 000 € et 10 000 000 €.
-TURNOVER_RANGES = []
-start_val = 1000000
-step_val = 500000
-while start_val < 10000000:
-    end_val = start_val + step_val
-    TURNOVER_RANGES.append((start_val, end_val))
-    start_val = end_val
+# Recherche 2 : 10M€ - 100M€ (effectifs de 6 à 500k, rayon 25km de Marseille)
+CONFIG_10M_100M = {
+    "output_file": "entreprises_pappers_10M.csv",
+    "base_url": (
+        "https://www.pappers.fr/recherche"
+        "?geolocalisation=43.2965%2C5.3698%2C25%2Cv"
+        "&siege=true"
+        "&effectifs_min=6"
+        "&effectifs_max=500000"
+    ),
+    "ranges": []  # Sera rempli de tranches de 5 000 000 €
+}
+start_2 = 10000000
+step_2 = 5000000
+while start_2 < 100000000:
+    end_2 = start_2 + step_2
+    CONFIG_10M_100M["ranges"].append((start_2, end_2))
+    start_2 = end_2
 
 # Liste de User-Agents réalistes pour simuler différents navigateurs récents
 USER_AGENTS = [
@@ -351,12 +370,16 @@ def parse_company_card(card: ElementHandle, page: Page) -> Dict[str, str]:
         "Marge nette": marge_clean if marge_clean else "Non disponible"
     }
 
-def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_pappers.csv", headless: bool = True) -> List[Dict[str, str]]:
+def scrape_pappers(config: Dict[str, Any], headless: bool = True) -> List[Dict[str, str]]:
     """
     Fonction principale de scraping de Pappers.fr.
     Parcourt toutes les pages de résultats, extrait les données d'entreprises
     et les exporte dans un fichier CSV.
     """
+    output_file = config["output_file"]
+    base_url = config["base_url"]
+    ranges = config["ranges"]
+
     all_companies = []
     scraped_sirens = set()
 
@@ -378,22 +401,13 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
         except Exception as e:
             logger.warning(f"Impossible de lire le CSV existant : {e}")
 
-    # Si l'URL par défaut est utilisée, on utilise le partitionnement par tranches de chiffre d'affaires
+    # Utilisation du partitionnement par tranches de chiffre d'affaires
     # pour contourner la limite de pagination de 10 pages de Pappers.fr
     urls_to_scrape = []
-    if url == TARGET_URL:
-        logger.info(f"Utilisation du partitionnement en {len(TURNOVER_RANGES)} tranches de CA pour contourner la limite des 10 pages.")
-        for min_val, max_val in TURNOVER_RANGES:
-            sub_url = (
-                "https://www.pappers.fr/recherche"
-                "?geolocalisation=43.2999009436%2C5.38227869795%2C10%2Cv"
-                "&siege=true"
-                f"&chiffre_affaires_min={min_val}"
-                f"&chiffre_affaires_max={max_val}"
-            )
-            urls_to_scrape.append((sub_url, f"{min_val} € - {max_val} €"))
-    else:
-        urls_to_scrape.append((url, "Filtre personnalisé"))
+    logger.info(f"Utilisation du partitionnement en {len(ranges)} tranches de CA pour contourner la limite des 10 pages.")
+    for min_val, max_val in ranges:
+        sub_url = f"{base_url}&chiffre_affaires_min={min_val}&chiffre_affaires_max={max_val}"
+        urls_to_scrape.append((sub_url, f"{min_val} € - {max_val} €"))
 
     with sync_playwright() as p:
         user_agent = random.choice(USER_AGENTS)
@@ -631,21 +645,24 @@ def scrape_pappers(url: str = TARGET_URL, output_file: str = "entreprises_papper
 
 if __name__ == "__main__":
     logger.info("Lancement du scraper Pappers.fr...")
-    # Mode headed par défaut comme spécifié dans les consignes techniques pour contourner
-    # de manière robuste les protections anti-bot (Cloudflare/recaptcha).
-    # Pour exécuter en mode invisible (headless), passer headless=True.
 
-    # Boucle de tentative robuste (retry loop) pour contourner d'éventuels blocages temporaires
-    max_attempts = 10
-    results = []
-    for attempt in range(1, max_attempts + 1):
-        logger.info(f"Tentative de scraping {attempt}/{max_attempts}...")
-        is_github = os.getenv("GITHUB_ACTIONS") == "true"
-        results = scrape_pappers(headless=is_github)
-        if results:
-            logger.info(f"Scraping réussi à la tentative {attempt} !")
-            break
-        logger.warning(f"La tentative {attempt} n'a retourné aucun résultat. Nouvelle tentative dans quelques secondes...")
-        time.sleep(random.uniform(3.0, 6.0))
+    # On exécute séquentiellement les deux configurations demandées par l'utilisateur
+    configs = [CONFIG_10M_100M, CONFIG_1M_10M]
+    is_github = os.getenv("GITHUB_ACTIONS") == "true"
 
-    logger.info(f"Travail terminé. {len(results)} entreprises traitées.")
+    for idx_conf, config in enumerate(configs, 1):
+        logger.info(f"=== DEBUT DE LA RECHERCHE {idx_conf}/{len(configs)} (Fichier : {config['output_file']}) ===")
+
+        # Boucle de tentative robuste (retry loop) pour contourner d'éventuels blocages temporaires
+        max_attempts = 10
+        results = []
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"Tentative de scraping {attempt}/{max_attempts}...")
+            results = scrape_pappers(config, headless=is_github)
+            if results:
+                logger.info(f"Scraping de la recherche {idx_conf} réussi à la tentative {attempt} !")
+                break
+            logger.warning(f"La tentative {attempt} n'a retourné aucun résultat. Nouvelle tentative dans quelques secondes...")
+            time.sleep(random.uniform(3.0, 6.0))
+
+    logger.info("Travail entièrement terminé pour toutes les recherches.")
