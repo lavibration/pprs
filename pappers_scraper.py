@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Pappers.fr Scraper
-Ce script extrait des données d'entreprises de Pappers.fr à partir d'une URL de recherche filtrée.
-Il utilise Playwright avec des techniques de contournement anti-bot et de simulation humaine.
+Pappers.fr Scraper & Financial Screener v2
+- Phase 1 : Sourcing rapide via les résultats de recherche Pappers (Marseille 25km, CA cible 800k€ à 3M€).
+- Phase 2 : Extraction de la fiche détaillée (https://www.pappers.fr/entreprise/{siren}),
+            parsing du tableau financier sur 3 exercices (N, N-1, N-2) et application des 4 critères de screening.
 """
 
 import os
@@ -11,8 +12,10 @@ import csv
 import time
 import random
 import logging
+import re
 from typing import List, Dict, Any, Optional, Tuple
-from playwright.sync_api import sync_playwright, Page, BrowserContext, ElementHandle
+import numpy as np
+from playwright.sync_api import sync_playwright, Page
 from playwright_stealth import Stealth
 
 # Configuration du logging
@@ -23,10 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pappers_scraper")
 
-# Configuration des deux recherches demandées par l'utilisateur
-# Recherche 1 : 1M€ - 10M€ (effectifs de 6 à 500k, rayon 25km de Marseille)
-CONFIG_1M_10M = {
-    "output_file": "entreprises_pappers.csv",
+# Configuration du screening (Marseille 25km, CA 800k€ à 3M€)
+CONFIG_SCREENING = {
+    "output_file": "entreprises_pappers_screened.csv",
     "base_url": (
         "https://www.pappers.fr/recherche"
         "?geolocalisation=43.2965%2C5.3698%2C25%2Cv"
@@ -34,35 +36,14 @@ CONFIG_1M_10M = {
         "&effectifs_min=6"
         "&effectifs_max=500000"
     ),
-    "ranges": []  # Sera rempli de tranches de 500 000 €
+    # Découpage par tranches de CA pour contourner la limite de pagination (10 pages max)
+    "ranges": [
+        (800000, 1500000),
+        (1500000, 2200000),
+        (2200000, 3000000)
+    ]
 }
-start_1 = 1000000
-step_1 = 500000
-while start_1 < 10000000:
-    end_1 = start_1 + step_1
-    CONFIG_1M_10M["ranges"].append((start_1, end_1))
-    start_1 = end_1
 
-# Recherche 2 : 10M€ - 100M€ (effectifs de 6 à 500k, rayon 25km de Marseille)
-CONFIG_10M_100M = {
-    "output_file": "entreprises_pappers_10M.csv",
-    "base_url": (
-        "https://www.pappers.fr/recherche"
-        "?geolocalisation=43.2965%2C5.3698%2C25%2Cv"
-        "&siege=true"
-        "&effectifs_min=6"
-        "&effectifs_max=500000"
-    ),
-    "ranges": []  # Sera rempli de tranches de 5 000 000 €
-}
-start_2 = 10000000
-step_2 = 5000000
-while start_2 < 100000000:
-    end_2 = start_2 + step_2
-    CONFIG_10M_100M["ranges"].append((start_2, end_2))
-    start_2 = end_2
-
-# Liste de User-Agents réalistes pour simuler différents navigateurs récents
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -70,599 +51,440 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
+FIELDNAMES = [
+    "Nom de l'entreprise",
+    "SIREN",
+    "Eligible_Screening",
+    "CA_N",
+    "Moyenne_CA_3ans",
+    "StdDev_CA_pct",
+    "EBITDA_N",
+    "Marge_EBITDA_pct",
+    "Cash_Conversion_pct",
+    "Treso_Nette_EUR",
+    "Ratio_Treso_EBITDA",
+    "Raison_Exclusion"
+]
+
 def clean_text(text: Optional[str]) -> str:
     """
-    Nettoie une chaîne de caractères en supprimant les espaces insécables,
-    les retours à la ligne, et en normalisant les espaces.
+    Nettoie une chaîne de caractères en normalisant les espaces et espaces insécables.
     """
     if not text:
         return ""
-    # Remplacer les espaces insécables (\xa0) et autres types d'espaces bizarres par des espaces simples
     cleaned = text.replace("\xa0", " ").replace("\u202f", " ")
     cleaned = " ".join(cleaned.split())
     return cleaned.strip()
 
-def clean_numeric_value(value: Optional[str]) -> str:
+def parse_pappers_number(val_str: Optional[str]) -> float:
     """
-    Nettoie et formate les valeurs financières (chiffre d'affaires, marge nette)
-    en supprimant '€', '%', et en nettoyant les espaces.
+    Convertit des chaînes financières de Pappers ('9,62 M', '79,1 k', '868', '11,6', '-', 'N/A') en float.
+    Prend en compte les suffixes (M, k), les décimales (virgules), les signes négatifs et parenthèses.
     """
-    if not value:
-        return ""
-    cleaned = clean_text(value)
-    # Suppression des symboles courants
-    cleaned = cleaned.replace("€", "").replace("%", "")
-    # Suppression des espaces résiduels pour faciliter l'analyse numérique ultérieure
-    cleaned = cleaned.replace(" ", "")
-    return cleaned.strip()
+    if not val_str:
+        return 0.0
 
-def save_to_csv(data: List[Dict[str, str]], filepath: str = "entreprises_pappers.csv") -> None:
-    """
-    Sauvegarde la liste d'entreprises dans un fichier CSV avec un encodage utf-8-sig
-    pour assurer une ouverture propre sous Microsoft Excel.
-    """
-    if not data:
-        logger.warning("Aucune donnée à sauvegarder dans le fichier CSV.")
-        return
+    cleaned = val_str.replace("\xa0", "").replace("\u202f", "").replace(" ", "")
+    cleaned = cleaned.replace("€", "").replace("%", "").replace(",", ".")
 
-    fieldnames = ["Nom de l'entreprise", "SIREN", "Chiffre d'affaires", "Marge nette"]
+    if cleaned in ["-", "", "N/A", "n/a", "ND", "nd", "NC", "nc", "--"]:
+        return 0.0
 
-    try:
-        with open(filepath, mode="w", encoding="utf-8-sig", newline="") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=";")
-            writer.writeheader()
-            for row in data:
-                writer.writerow({
-                    "Nom de l'entreprise": row.get("Nom de l'entreprise", ""),
-                    "SIREN": row.get("SIREN", ""),
-                    "Chiffre d'affaires": row.get("Chiffre d'affaires", ""),
-                    "Marge nette": row.get("Marge nette", "")
-                })
-        logger.info(f"Sauvegarde réussie dans {filepath} ({len(data)} entreprises exportées).")
-    except Exception as e:
-        logger.error(f"Erreur lors de l'écriture du fichier CSV : {e}")
+    is_negative = False
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        is_negative = True
+        cleaned = cleaned[1:-1]
+    elif cleaned.startswith("-"):
+        is_negative = True
+        cleaned = cleaned[1:]
 
-def append_to_csv(data: List[Dict[str, str]], filepath: str = "entreprises_pappers.csv") -> None:
-    """
-    Ajoute une liste d'entreprises au fichier CSV en cours avec encodage utf-8-sig.
-    Si le fichier n'existe pas, il écrit l'en-tête en premier.
-    """
-    if not data:
-        return
-
-    fieldnames = ["Nom de l'entreprise", "SIREN", "Chiffre d'affaires", "Marge nette"]
-    file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
+    multiplier = 1.0
+    if "M" in cleaned:
+        multiplier = 1_000_000.0
+        cleaned = cleaned.replace("M", "")
+    elif "k" in cleaned:
+        multiplier = 1_000.0
+        cleaned = cleaned.replace("k", "")
 
     try:
-        with open(filepath, mode="a", encoding="utf-8-sig", newline="") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=";")
-            if not file_exists:
-                writer.writeheader()
-            for row in data:
-                writer.writerow({
-                    "Nom de l'entreprise": row.get("Nom de l'entreprise", ""),
-                    "SIREN": row.get("SIREN", ""),
-                    "Chiffre d'affaires": row.get("Chiffre d'affaires", ""),
-                    "Marge nette": row.get("Marge nette", "")
-                })
-    except Exception as e:
-        logger.error(f"Erreur lors de l'écriture incrémentale du fichier CSV : {e}")
+        val = float(cleaned) * multiplier
+        return -val if is_negative else val
+    except ValueError:
+        return 0.0
 
 def extract_siren_from_text(text: str) -> Optional[str]:
     """
-    Extrait un SIREN (9 chiffres consécutifs) d'un texte.
+    Extrait un SIREN valide (9 chiffres) d'un texte ou d'une URL.
     """
-    import re
-    # Recherche 9 chiffres consécutifs, potentiellement séparés par des espaces
+    if not text:
+        return None
     normalized = re.sub(r"\s+", "", text)
     match = re.search(r"\b(\d{9})\b", normalized)
     if match:
         return match.group(1)
-    # Autre tentative de recherche au cas où
     match_anywhere = re.search(r"(\d{9})", normalized)
     if match_anywhere:
         return match_anywhere.group(1)
     return None
 
-def extract_financials_from_text(text: str) -> Tuple[str, str]:
+def append_to_csv(data: List[Dict[str, Any]], filepath: str) -> None:
     """
-    Analyse le texte d'un élément/carte pour en extraire le Chiffre d'Affaires et la Marge Nette.
+    Ajoute les résultats au fichier CSV avec encodage utf-8-sig et séparateur ';'.
     """
-    import re
-    ca = ""
-    marge = ""
-
-    # Stratégie 1 : Recherche très précise du Chiffre d'affaires (avec ou sans année)
-    # Ex: "Chiffre d'affaires 2022 : 1 183 024 €" ou "Chiffre d'affaires : 1 183 024 €"
-    ca_patterns = [
-        r"Chiffre\s+d'affaires\s*(?:\d{4})?\s*:\s*([0-9\s \u202f,\.\-]+€)",
-        r"(?:Chiffre d'affaires|CA)\s*[:\-]?\s*([0-9\s \u202f,\.\-]+€)",
-        r"([0-9\s \u202f,\.\-]+€)\s*(?:\(CA\)|CA|Chiffre d'affaires)"
-    ]
-    for pattern in ca_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            ca = match.group(1)
-            break
-
-    marge_patterns = [
-        r"Marge\s+nette\s*:\s*([\-\+]?[0-9\s \u202f,\.\-]+\s*%)",
-        r"(?:Marge nette|Marge)\s*[:\-]?\s*([\-\+]?[0-9\s \u202f,\.\-]+\s*%)",
-        r"([\-\+]?[0-9\s \u202f,\.\-]+\s*%)\s*(?:Marge nette|Marge)"
-    ]
-    for pattern in marge_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            marge = match.group(1)
-            break
-
-    # Stratégie 2 : Recherche brute si non trouvé (en excluant la ligne du Capital qui est souvent "Capital : XX €")
-    if not ca:
-        # On essaie d'exclure la ligne du Capital pour éviter de confondre Chiffre d'affaires et Capital Social
-        lines = text.split("\n")
-        non_capital_lines = [line for line in lines if "capital" not in line.lower()]
-        for line in non_capital_lines:
-            euro_matches = re.findall(r"([0-9\s \u202f]{3,}(?:,[0-9]+)?\s*€)", line)
-            if euro_matches:
-                ca = euro_matches[0]
-                break
-
-    if not marge:
-        # Cherche n'importe quel pourcentage
-        pct_matches = re.findall(r"(\-?[0-9]+(?:\s*,\s*[0-9]+)?\s*%)", text)
-        if pct_matches:
-            marge = pct_matches[0]
-
-    return ca, marge
-
-def parse_company_card(card: ElementHandle, page: Page) -> Dict[str, str]:
-    """
-    Analyse une carte de résultat d'entreprise pour en extraire le Nom, le SIREN,
-    le Chiffre d'Affaires, et la Marge Nette.
-    """
-    # 1. Extraction du Nom de l'entreprise
-    # Pappers affiche typiquement le nom de l'entreprise dans un en-tête bleu ou un lien de titre.
-    # Nous essayons plusieurs sélecteurs flexibles
-    name = ""
-    name_selectors = [
-        ".nom-entreprise",
-        "h3",
-        "h2",
-        "a.title",
-        "a.resultat-titre",
-        ".recherche-resultat-nom",
-        "div.flex.justify-between.items-center h3",
-        "[class*='titre']",
-        "[class*='nom']"
-    ]
-    for selector in name_selectors:
-        try:
-            el = card.query_selector(selector)
-            if el:
-                name = el.inner_text()
-                if name:
-                    break
-        except Exception:
-            continue
-
-    if not name:
-        # Fallback : premier lien ou première ligne textuelle significative
-        try:
-            name = card.inner_text().split("\n")[0]
-        except Exception:
-            name = "Inconnu"
-
-    name = clean_text(name)
-    logger.info(f"Analyse de l'entreprise : '{name}'")
-
-    # 2. Extraction du SIREN
-    # On regarde d'abord si un lien vers l'entreprise contient un SIREN à 9 chiffres
-    siren = ""
+    if not data:
+        return
+    file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
     try:
-        links = card.query_selector_all("a")
-        for link in links:
-            href = link.get_attribute("href")
-            if href:
-                # Exemple de lien: /entreprise/nom-entreprise-123456789
-                siren_opt = extract_siren_from_text(href)
-                if siren_opt:
-                    siren = siren_opt
-                    break
+        with open(filepath, mode="a", encoding="utf-8-sig", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=FIELDNAMES, delimiter=";")
+            if not file_exists:
+                writer.writeheader()
+            for row in data:
+                writer.writerow({k: row.get(k, "") for k in FIELDNAMES})
     except Exception as e:
-        logger.debug(f"Erreur d'extraction du SIREN à partir des liens : {e}")
+        logger.error(f"Erreur d'écriture CSV : {e}")
 
-    # Si le SIREN n'est pas dans l'URL, on le cherche dans le texte de la carte
-    card_text = ""
-    try:
-        card_text = card.inner_text()
-    except Exception:
-        pass
-
-    if not siren and card_text:
-        siren_opt = extract_siren_from_text(card_text)
-        if siren_opt:
-            siren = siren_opt
-
-    # Fallback ultime spécifié dans les consignes : cliquer sur la carte / le bouton flèche à droite
-    # pour ouvrir le détail ou le volet de l'entreprise.
-    if not siren:
-        logger.info(f"SIREN non trouvé directement pour '{name}'. Tentative d'ouverture du détail...")
-        original_url = page.url
-        try:
-            # On cherche un bouton avec une flèche à droite ou le lien de la carte
-            arrow_btn = card.query_selector("button, a.arrow, [class*='arrow'], .resultat-detail-link")
-            if arrow_btn:
-                arrow_btn.click()
-            else:
-                card.click()
-
-            # Attendre un court instant que le détail s'affiche
-            time.sleep(random.uniform(2.0, 3.0))
-
-            # Essayer d'extraire le SIREN depuis l'URL de la nouvelle page de détail
-            current_url = page.url
-            siren_opt = extract_siren_from_text(current_url)
-            if siren_opt:
-                siren = siren_opt
-                logger.info(f"SIREN trouvé dans l'URL de détail : {siren}")
-            else:
-                # Essayer d'extraire le SIREN du DOM global
-                body_text = page.inner_text("body")
-                siren_opt = extract_siren_from_text(body_text)
-                if siren_opt:
-                    siren = siren_opt
-                    logger.info(f"SIREN trouvé dans la page de détail : {siren}")
-
-            # Si on a navigué vers une nouvelle page, on retourne à la page de recherche précédente
-            if page.url != original_url:
-                logger.info("Retour à la liste des résultats...")
-                page.go_back()
-                # Attendre le rechargement de la page de recherche
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
-                time.sleep(random.uniform(1.5, 2.5))
-            else:
-                # Si c'était un volet latéral ou une modale, fermer avec Escape
-                page.keyboard.press("Escape")
-                time.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"Impossible de cliquer sur la carte pour '{name}' : {e}")
-            # Sécurité : s'assurer qu'on retourne bien sur l'URL d'origine si on s'est perdu
-            if page.url != original_url:
-                try:
-                    page.go_back()
-                    page.wait_for_load_state("domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
-
-    # 3. Extraction du Chiffre d'Affaires et de la Marge Nette
-    ca_raw = ""
-    marge_raw = ""
-
-    # Essayons de chercher des éléments contenant ces étiquettes de façon plus précise d'abord
-    try:
-        # Pappers affiche souvent les données financières dans un tableau ou sous forme de paires étiquette-valeur.
-        # Par exemple : un div contenant "Chiffre d'affaires" et à côté un span/div avec la valeur.
-        ca_el = card.query_selector("td:right-of(:text('Chiffre d\'affaires')), div:right-of(:text('Chiffre d\'affaires'))")
-        if ca_el:
-            ca_raw = ca_el.inner_text()
-        marge_el = card.query_selector("td:right-of(:text('Marge nette')), div:right-of(:text('Marge nette'))")
-        if marge_el:
-            marge_raw = marge_el.inner_text()
-    except Exception:
-        pass
-
-    # Si non trouvé de manière ciblée, on extrait globalement du texte de la carte
-    if (not ca_raw or not marge_raw) and card_text:
-        ca_extracted, marge_extracted = extract_financials_from_text(card_text)
-        if not ca_raw:
-            ca_raw = ca_extracted
-        if not marge_raw:
-            marge_raw = marge_extracted
-
-    # Nettoyage des valeurs
-    ca_clean = clean_numeric_value(ca_raw)
-    marge_clean = clean_numeric_value(marge_raw)
-
-    return {
-        "Nom de l'entreprise": name,
-        "SIREN": siren if siren else "Non trouvé",
-        "Chiffre d'affaires": ca_clean if ca_clean else "Non disponible",
-        "Marge nette": marge_clean if marge_clean else "Non disponible"
+def parse_financial_rows(rows_data: List[Tuple[str, List[str]]]) -> Dict[str, List[float]]:
+    """
+    Extrait les séries financières (CA, EBITDA, REX, Trésorerie, Dettes)
+    à partir des paires (label, valeurs des cellules).
+    """
+    data_series = {
+        "ca": [],
+        "ebitda": [],
+        "rex": [],
+        "tresorerie": [],
+        "dettes_fin": []
     }
 
-def scrape_pappers(config: Dict[str, Any], headless: bool = True) -> List[Dict[str, str]]:
+    for label_raw, cell_texts in rows_data:
+        label = clean_text(label_raw).lower()
+        # Les 3 premières colonnes d'exercices correspondent aux 3 dernières années (N, N-1, N-2)
+        values = [parse_pappers_number(val) for val in cell_texts[:3]]
+
+        if "chiffre d’affaires" in label or "chiffre d'affaires" in label or label == "ca":
+            if not data_series["ca"]:
+                data_series["ca"] = values
+        elif "ebitda - ebe" in label or "ebitda" in label or "ebe" in label:
+            if not data_series["ebitda"]:
+                data_series["ebitda"] = values
+        elif "résultat d’exploitation" in label or "résultat d'exploitation" in label or "rex" in label:
+            if not data_series["rex"]:
+                data_series["rex"] = values
+        elif "trésorerie" in label or "tresorerie" in label:
+            if not data_series["tresorerie"]:
+                data_series["tresorerie"] = values
+        elif "dettes financières" in label or "dettes financieres" in label:
+            if not data_series["dettes_fin"]:
+                data_series["dettes_fin"] = values
+
+    return data_series
+
+def scrape_financial_table(page: Page, siren: str, company_url: Optional[str] = None) -> Dict[str, List[float]]:
     """
-    Fonction principale de scraping de Pappers.fr.
-    Parcourt toutes les pages de résultats, extrait les données d'entreprises
-    et les exporte dans un fichier CSV.
+    Se rend sur la page de détail Pappers et extrait les séries sur 3 ans (N, N-1, N-2).
     """
+    detail_url = company_url if (company_url and company_url.startswith("http")) else f"https://www.pappers.fr/entreprise/{siren}"
+    logger.info(f"Scraping fiche détaillée : {detail_url}")
+
+    data_series = {
+        "ca": [],
+        "ebitda": [],
+        "rex": [],
+        "tresorerie": [],
+        "dettes_fin": []
+    }
+
+    try:
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(random.uniform(1.5, 3.5))
+
+        # Cookie banner (si nécessaire sur la page fiche)
+        try:
+            cookie_btn = page.query_selector("button:has-text('Accepter'), button:has-text('Tout accepter'), #cookies-consent-accept, .cc-btn")
+            if cookie_btn and cookie_btn.is_visible():
+                cookie_btn.click()
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+        # Recherche du tableau financier HTML
+        table = page.query_selector("table.w-full.border-collapse, table[class*='border-collapse'], table.tableau-financier")
+        if not table:
+            logger.warning(f"Tableau financier introuvable pour SIREN {siren}")
+            return data_series
+
+        rows = table.query_selector_all("tr")
+        rows_data = []
+        for row in rows:
+            cells = row.query_selector_all("td, th")
+            if len(cells) < 2:
+                continue
+
+            label = cells[0].inner_text().strip()
+            # Dans le tableau Pappers, la colonne 0 est le libellé.
+            # Si la colonne 1 est une unité/variante ou le premier chiffre, on prend les cellules de données
+            cell_texts = [c.inner_text().strip() for c in cells[1:]]
+            rows_data.append((label, cell_texts))
+
+        data_series = parse_financial_rows(rows_data)
+
+    except Exception as e:
+        logger.error(f"Erreur lors de l'extraction de la fiche {siren} : {e}")
+
+    return data_series
+
+def evaluate_financial_criteria(history_data: dict) -> Tuple[bool, dict]:
+    """
+    Évalue les 4 critères de screening financier sur les 3 derniers exercices :
+    1. Taille & Stabilité du CA : 800k€ <= CA_N <= 3M€ et StdDev(CA_3ans) / Mean(CA_3ans) < 15%
+    2. Marge EBITDA opérationnelle : EBITDA_N / CA_N >= 12%
+    3. Taux de conversion Cash-Flow (Proxy) : REX_N / EBITDA_N >= 75%
+    4. Trésorerie Nette / EBITDA : (Trésorerie_N - Dettes_N) / EBITDA_N >= 1.0x
+    """
+    ca_history = history_data.get("ca", [])
+    ebitda_history = history_data.get("ebitda", [])
+    rex_history = history_data.get("rex", [])
+    treso_history = history_data.get("tresorerie", [])
+    dettes_history = history_data.get("dettes_fin", [])
+
+    if len(ca_history) < 3 or ca_history[0] == 0:
+        return False, {
+            "Eligible_Screening": "NON",
+            "CA_N": round(ca_history[0], 2) if ca_history else 0.0,
+            "Moyenne_CA_3ans": 0.0,
+            "StdDev_CA_pct": 0.0,
+            "EBITDA_N": 0.0,
+            "Marge_EBITDA_pct": 0.0,
+            "Cash_Conversion_pct": 0.0,
+            "Treso_Nette_EUR": 0.0,
+            "Ratio_Treso_EBITDA": 0.0,
+            "Raison_Exclusion": "Historique CA < 3 ans ou CA_N nul"
+        }
+
+    ca_n = ca_history[0]
+    ebitda_n = ebitda_history[0] if len(ebitda_history) > 0 else 0.0
+    rex_n = rex_history[0] if len(rex_history) > 0 else 0.0
+    treso_n = treso_history[0] if len(treso_history) > 0 else 0.0
+    dettes_n = dettes_history[0] if len(dettes_history) > 0 else 0.0
+
+    # 1. Filtre CA (800k€ - 3M€) & Stabilité 3 ans (Std dev relative < 15%)
+    ca_3ans = ca_history[:3]
+    ca_mean = float(np.mean(ca_3ans))
+    ca_std = float(np.std(ca_3ans))
+    std_dev_pct = (ca_std / ca_mean) * 100.0 if ca_mean > 0 else 999.0
+
+    cond_ca_range = (800_000.0 <= ca_n <= 3_000_000.0)
+    cond_ca_stability = (std_dev_pct < 15.0)
+
+    # 2. Marge d'EBITDA (>= 12%)
+    marge_ebitda = (ebitda_n / ca_n) * 100.0 if ca_n > 0 else 0.0
+    cond_ebitda = (marge_ebitda >= 12.0)
+
+    # 3. Cash-Flow Conversion Proxy (REX / EBITDA >= 75%)
+    cash_conversion = (rex_n / ebitda_n) * 100.0 if ebitda_n > 0 else 0.0
+    cond_cash_conv = (cash_conversion >= 75.0)
+
+    # 4. Trésorerie Nette / EBITDA (>= 1.0x)
+    treso_nette = treso_n - dettes_n
+    ratio_treso_ebitda = (treso_nette / ebitda_n) if ebitda_n > 0 else -999.0
+    cond_treso = (ratio_treso_ebitda >= 1.0)
+
+    is_eligible = bool(cond_ca_range and cond_ca_stability and cond_ebitda and cond_cash_conv and cond_treso)
+
+    reasons = []
+    if not cond_ca_range:
+        reasons.append(f"CA hors plage ({ca_n:,.0f}€)")
+    if not cond_ca_stability:
+        reasons.append(f"Instabilité CA (std={std_dev_pct:.1f}%)")
+    if not cond_ebitda:
+        reasons.append(f"Marge EBITDA faible ({marge_ebitda:.1f}%)")
+    if not cond_cash_conv:
+        reasons.append(f"Cash Conv. faible ({cash_conversion:.1f}%)")
+    if not cond_treso:
+        reasons.append(f"Ratio Treso/EBITDA faible ({ratio_treso_ebitda:.2f}x)")
+
+    metrics = {
+        "Eligible_Screening": "OUI" if is_eligible else "NON",
+        "CA_N": round(ca_n, 2),
+        "Moyenne_CA_3ans": round(ca_mean, 2),
+        "StdDev_CA_pct": round(std_dev_pct, 2),
+        "EBITDA_N": round(ebitda_n, 2),
+        "Marge_EBITDA_pct": round(marge_ebitda, 2),
+        "Cash_Conversion_pct": round(cash_conversion, 2),
+        "Treso_Nette_EUR": round(treso_nette, 2),
+        "Ratio_Treso_EBITDA": round(ratio_treso_ebitda, 2),
+        "Raison_Exclusion": " / ".join(reasons) if reasons else "Aucune"
+    }
+
+    return is_eligible, metrics
+
+def scrape_and_screen(headless: bool = True):
+    config = CONFIG_SCREENING
     output_file = config["output_file"]
     base_url = config["base_url"]
     ranges = config["ranges"]
 
-    all_companies = []
-    scraped_sirens = set()
-
-    # Charger les entreprises déjà scrapées si le fichier existe pour pouvoir reprendre le travail
-    # et éviter de rescraper les mêmes données
+    # Chargement des SIRENs déjà traités pour reprise incrémentale
+    processed_sirens = set()
     if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-        logger.info(f"Chargement des entreprises existantes depuis {output_file} pour éviter les doublons et reprendre le scraping.")
         try:
             with open(output_file, mode="r", encoding="utf-8-sig") as csvfile:
                 reader = csv.DictReader(csvfile, delimiter=";")
                 for row in reader:
                     siren = row.get("SIREN", "")
-                    name = row.get("Nom de l'entreprise", "")
-                    if siren and siren != "Non trouvé":
-                        scraped_sirens.add(siren)
-                    elif name:
-                        scraped_sirens.add(name)
-            logger.info(f"Déjà {len(scraped_sirens)} entreprises uniques chargées depuis le CSV.")
+                    if siren:
+                        processed_sirens.add(siren)
+            logger.info(f"{len(processed_sirens)} SIRENs déjà traités et chargés depuis {output_file}")
         except Exception as e:
-            logger.warning(f"Impossible de lire le CSV existant : {e}")
-
-    # Utilisation du partitionnement par tranches de chiffre d'affaires
-    # pour contourner la limite de pagination de 10 pages de Pappers.fr
-    urls_to_scrape = []
-    logger.info(f"Utilisation du partitionnement en {len(ranges)} tranches de CA pour contourner la limite des 10 pages.")
-    for min_val, max_val in ranges:
-        sub_url = f"{base_url}&chiffre_affaires_min={min_val}&chiffre_affaires_max={max_val}"
-        urls_to_scrape.append((sub_url, f"{min_val} € - {max_val} €"))
+            logger.warning(f"Erreur de lecture du CSV existant : {e}")
 
     with sync_playwright() as p:
         user_agent = random.choice(USER_AGENTS)
-        logger.info(f"Démarrage du navigateur avec l'User-Agent : {user_agent}")
-
-        # Lancement du navigateur avec une configuration réaliste
         browser = p.chromium.launch(
             headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox"
-            ]
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-setuid-sandbox"]
         )
-
         context = browser.new_context(
             user_agent=user_agent,
             viewport={"width": 1280, "height": 800},
             locale="fr-FR",
             timezone_id="Europe/Paris"
         )
-
-        # Activation de stealth pour masquer Playwright des scripts anti-bot
         try:
-            stealth = Stealth()
-            stealth.apply_stealth_sync(context)
+            Stealth().apply_stealth_sync(context)
         except Exception as e:
             logger.debug(f"Erreur d'initialisation de stealth : {e}")
 
         page = context.new_page()
 
-        # Pour chaque URL / tranche de chiffre d'affaires
-        for idx, (target_url, label) in enumerate(urls_to_scrape, 1):
-            logger.info(f"=== Début de la tranche {idx}/{len(urls_to_scrape)} : {label} ===")
+        for idx, (min_val, max_val) in enumerate(ranges, 1):
+            target_url = f"{base_url}&chiffre_affaires_min={min_val}&chiffre_affaires_max={max_val}"
+            logger.info(f"=== Recherche tranche CA {idx}/{len(ranges)} : {min_val:,.0f}€ - {max_val:,.0f}€ ===")
 
-            # Navigation vers l'URL
-            logger.info(f"Navigation vers l'URL : {target_url}")
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(random.uniform(2.0, 3.5))
             except Exception as e:
-                logger.error(f"Erreur lors du chargement de la tranche : {e}")
+                logger.error(f"Erreur chargement tranche {min_val}-{max_val} : {e}")
                 continue
 
-            # Simulation d'un délai humain après chargement
-            time.sleep(random.uniform(2.0, 4.0))
+            try:
+                cookie_btn = page.query_selector("button:has-text('Accepter'), button:has-text('Tout accepter'), #cookies-consent-accept, .cc-btn")
+                if cookie_btn and cookie_btn.is_visible():
+                    cookie_btn.click()
+                    time.sleep(1.0)
+            except Exception:
+                pass
 
-            # Gestion des cookies seulement lors du premier chargement de la première tranche
-            if idx == 1:
-                try:
-                    cookie_btn = page.query_selector(
-                        "button:has-text('Accepter'), button:has-text('Tout accepter'), #cookies-consent-accept, .cc-btn"
-                    )
-                    if cookie_btn and cookie_btn.is_visible():
-                        cookie_btn.click()
-                        logger.info("Cookies acceptés.")
-                        time.sleep(random.uniform(1.0, 2.0))
-                except Exception as e:
-                    logger.debug(f"Pas de bannière de cookies détectée ou erreur de clic : {e}")
-
-            page_number = 1
+            page_num = 1
             while True:
-                logger.info(f"--- Scraping de la tranche {label} - Page {page_number} ---")
-                page_companies = []
-
-                # Faire défiler la page pour simuler une lecture et s'assurer du chargement des images/éléments
-                try:
-                    for _ in range(3):
-                        page.evaluate("window.scrollBy(0, window.innerHeight / 2)")
-                        time.sleep(random.uniform(0.3, 0.7))
-                except Exception as e:
-                    logger.debug(f"Erreur d'évaluation du scroll : {e}")
-
-                # Sélectionner toutes les cartes ou lignes de résultats
-                # Sélecteurs flexibles basés sur l'architecture standard de Pappers
+                logger.info(f"Page {page_num} de la tranche {min_val}-{max_val}")
                 card_selectors = [
                     ".resultat-recherche",
                     ".recherche-resultat",
                     "div.border.rounded-lg",
                     "tr.resultat",
-                    "[class*='resultat']",
-                    "a[href*='/entreprise/']"
+                    "[class*='resultat']"
                 ]
 
                 cards = []
                 for selector in card_selectors:
-                    try:
-                        cards = page.query_selector_all(selector)
-                        if cards:
-                            logger.info(f"Trouvé {len(cards)} éléments avec le sélecteur '{selector}'")
-                            break
-                    except Exception:
-                        continue
+                    cards = page.query_selector_all(selector)
+                    if cards:
+                        break
 
                 if not cards:
-                    logger.warning("Aucun élément de résultat spécifique trouvé sur cette page.")
+                    logger.info("Aucun résultat trouvé sur cette page.")
                     break
 
-                # Analyse de chaque carte d'entreprise sur la page en cours
+                sirens_to_process = []
                 for card in cards:
+                    text = card.inner_text()
+                    siren = extract_siren_from_text(text)
+
+                    # Chercher également le lien direct dans la carte
+                    direct_url = None
                     try:
-                        # 1. Extraction ultra-rapide et légère du nom pour filtrer les faux positifs avant toute analyse lourde
-                        el = card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                        if el:
-                            name_val = el.inner_text().strip()
-                            name_lower = name_val.lower()
-                            if "résultats" in name_lower or "recherche" in name_lower or not name_val:
-                                logger.info(f"Ignorer l'élément faux positif avant analyse : '{name_val}'")
-                                continue
+                        links = card.query_selector_all("a")
+                        for link in links:
+                            href = link.get_attribute("href")
+                            if href and "/entreprise/" in href:
+                                if not siren:
+                                    siren = extract_siren_from_text(href)
+                                direct_url = f"https://www.pappers.fr{href}" if href.startswith("/") else href
+                                break
+                    except Exception:
+                        pass
 
-                        company_data = parse_company_card(card, page)
-                        if company_data:
-                            # Déduplication basée sur le SIREN ou le Nom de l'entreprise
-                            siren_val = company_data.get("SIREN", "")
-                            name_val = company_data.get("Nom de l'entreprise", "")
-                            dedup_key = siren_val if (siren_val and siren_val != "Non trouvé") else name_val
+                    name_el = card.query_selector(".nom-entreprise, h3, h2, a.title, [class*='titre'], [class*='nom']")
+                    name = clean_text(name_el.inner_text()) if name_el else "Inconnu"
 
-                            if dedup_key in scraped_sirens:
-                                logger.info(f"Ignorer l'entreprise déjà scrapée (clé : '{dedup_key}')")
-                                continue
+                    if siren and siren not in processed_sirens:
+                        sirens_to_process.append((name, siren, direct_url))
 
-                            scraped_sirens.add(dedup_key)
-                            all_companies.append(company_data)
-                            page_companies.append(company_data)
-                    except Exception as e:
-                        logger.error(f"Erreur d'analyse d'une carte d'entreprise : {e}")
+                logger.info(f"{len(sirens_to_process)} nouvelles entreprises à analyser sur cette page.")
 
-                    # Délai aléatoire court entre l'analyse de chaque entreprise pour simuler un humain
-                    time.sleep(random.uniform(0.5, 1.5))
+                # PHASE 2 : Visite de la fiche détaillée pour chaque entreprise
+                for name, siren, direct_url in sirens_to_process:
+                    logger.info(f"Traitement de {name} (SIREN: {siren})...")
 
-                # Sauvegarde incrémentale de la page en cours
-                if page_companies:
-                    append_to_csv(page_companies, output_file)
-                    logger.info(f"Tranche {label} - Page {page_number} sauvegardée incrémentiellement ({len(page_companies)} entreprises ajoutées).")
+                    detail_page = context.new_page()
+                    history_data = scrape_financial_table(detail_page, siren, company_url=direct_url)
+                    detail_page.close()
 
-                # --- Gestion de la pagination ---
-                logger.info("Recherche du bouton de pagination suivante...")
-                next_btn = None
+                    is_eligible, metrics = evaluate_financial_criteria(history_data)
 
-                # Sélecteurs possibles pour la flèche droite ou bouton page suivante
+                    row_data = {
+                        "Nom de l'entreprise": name,
+                        "SIREN": siren,
+                        **metrics
+                    }
+
+                    # Sauvegarde incrémentale
+                    append_to_csv([row_data], output_file)
+                    processed_sirens.add(siren)
+
+                    # Tempo anti-bot inter-fiches (1.5s à 3.5s)
+                    sleep_time = random.uniform(1.5, 3.5)
+                    logger.info(f"Attente anti-bot de {sleep_time:.2f}s...")
+                    time.sleep(sleep_time)
+
+                # Pagination
                 next_selectors = [
                     "a.pagination-image-right:not(.disabled)",
                     "a.pagination.pagination-image-right:not(.disabled)",
                     "a.pagination-suivant",
                     "button.pagination-suivant",
                     "a:has-text('Suivant')",
-                    "button:has-text('Suivant')",
-                    ".pagination a:last-child",
-                    "ul.pagination li:last-child a",
-                    "svg[class*='right']",
-                    "a[aria-label='Next']",
-                    "button[aria-label='Next']",
-                    "xpath=//a[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]",
-                    "xpath=//button[contains(., '›') or contains(., 'Suivant') or contains(., 'Next')]"
+                    "button:has-text('Suivant')"
                 ]
-
+                next_btn = None
                 for selector in next_selectors:
                     try:
                         el = page.query_selector(selector)
                         if el and el.is_visible() and el.is_enabled():
-                            btn_text = el.inner_text().strip()
-                            if btn_text and any(prev in btn_text.lower() for prev in ["précédent", "previous", "‹"]):
-                                continue
                             next_btn = el
-                            logger.info(f"Bouton page suivante trouvé avec le sélecteur '{selector}'")
                             break
                     except Exception:
                         continue
 
                 if next_btn:
                     try:
-                        # Récupérer le nom de la première entreprise sur la page actuelle pour détecter la mise à jour
-                        first_company_before = ""
-                        if cards:
-                            try:
-                                for first_card in cards:
-                                    el = first_card.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                                    if el:
-                                        name_val = el.inner_text().strip()
-                                        if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
-                                            first_company_before = name_val
-                                            break
-                            except Exception:
-                                pass
-
-                        # Défilement vers le bouton de pagination pour pouvoir cliquer dessus de façon réaliste
                         next_btn.scroll_into_view_if_needed()
                         time.sleep(random.uniform(0.5, 1.0))
                         next_btn.click()
-                        page_number += 1
-
-                        # Attendre la mise à jour des résultats
-                        if first_company_before:
-                            logger.info(f"En attente de la mise à jour des résultats (changement de '{first_company_before}')...")
-                            start_time = time.time()
-                            updated = False
-                            while time.time() - start_time < 15:
-                                try:
-                                    for sel in card_selectors:
-                                        new_cards = page.query_selector_all(sel)
-                                        if new_cards:
-                                            new_first_name = ""
-                                            for nc in new_cards:
-                                                el = nc.query_selector(".nom-entreprise, h3, h2, a.title, a.resultat-titre, .recherche-resultat-nom, [class*='titre']")
-                                                if el:
-                                                    name_val = el.inner_text().strip()
-                                                    if name_val and "résultats" not in name_val.lower() and "recherche" not in name_val.lower():
-                                                        new_first_name = name_val
-                                                        break
-                                            if new_first_name and new_first_name != first_company_before:
-                                                logger.info(f"Résultats chargés avec succès ! Nouvelle première entreprise : '{new_first_name}'")
-                                                updated = True
-                                                break
-                                    if updated:
-                                        break
-                                except Exception:
-                                    pass
-                                time.sleep(0.5)
-                        else:
-                            page.wait_for_load_state("domcontentloaded", timeout=30000)
-                            time.sleep(random.uniform(3.0, 5.0))
+                        page_num += 1
+                        time.sleep(random.uniform(2.5, 4.0))
                     except Exception as e:
-                        logger.error(f"Erreur lors du clic sur le bouton de page suivante : {e}")
+                        logger.error(f"Erreur de pagination : {e}")
                         break
                 else:
-                    logger.info("Pas d'autre page disponible dans cette tranche.")
+                    logger.info("Fin des pages pour cette tranche.")
                     break
 
-        # Fermeture du navigateur
         browser.close()
 
-    if not all_companies:
-        logger.warning("Aucune entreprise n'a pu être scrapée.")
-
-    return all_companies
-
 if __name__ == "__main__":
-    logger.info("Lancement du scraper Pappers.fr...")
-
-    # On exécute séquentiellement les deux configurations demandées par l'utilisateur
-    configs = [CONFIG_10M_100M, CONFIG_1M_10M]
-    is_github = os.getenv("GITHUB_ACTIONS") == "true"
-
-    for idx_conf, config in enumerate(configs, 1):
-        logger.info(f"=== DEBUT DE LA RECHERCHE {idx_conf}/{len(configs)} (Fichier : {config['output_file']}) ===")
-
-        # Boucle de tentative robuste (retry loop) pour contourner d'éventuels blocages temporaires
-        max_attempts = 10
-        results = []
-        for attempt in range(1, max_attempts + 1):
-            logger.info(f"Tentative de scraping {attempt}/{max_attempts}...")
-            results = scrape_pappers(config, headless=is_github)
-            if results:
-                logger.info(f"Scraping de la recherche {idx_conf} réussi à la tentative {attempt} !")
-                break
-            logger.warning(f"La tentative {attempt} n'a retourné aucun résultat. Nouvelle tentative dans quelques secondes...")
-            time.sleep(random.uniform(3.0, 6.0))
-
-    logger.info("Travail entièrement terminé pour toutes les recherches.")
+    logger.info("Démarrage du script Pappers Screener v2...")
+    scrape_and_screen(headless=os.getenv("GITHUB_ACTIONS") == "true")
